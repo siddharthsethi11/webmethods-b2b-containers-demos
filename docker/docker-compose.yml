@@ -1,0 +1,100 @@
+---
+name: webmethods-b2b
+
+networks:
+  ibm_demos_b2b_net:
+    external: true
+
+volumes:
+  postgres_data:
+    driver: local
+  msr_cache_data:
+    driver: local
+  mws_data:
+    driver: local  
+  mws_logs:
+    driver: local
+
+services:
+
+  msr:
+    image: ${REG_MSR_TN}${REPO_MSR_TN}:${TAG_MSR_TN}
+    restart: ${RESTART_POLICY_RUNTIMES}
+    volumes:
+      - ./application.properties:/opt/softwareag/IntegrationServer/application.properties:ro
+    ports:
+      - "5555:5555"
+    environment: 
+      ADMIN_PASSWORD: ${MSR_ADMIN_PASSWORD}
+      JAVA_CUSTOM_OPTS: "-server -Dtest=1 -Dtes2=2 -Dtest3=3"
+      JAVA_MIN_MEM: 1g
+      JAVA_MAX_MEM: 1g
+      TN_DB_URL: jdbc:wm:postgresql://postgres:5432;DatabaseName=${POSTGRES_TN_DB}
+      TN_DB_USER: ${POSTGRES_TN_DBUSER}
+      TN_DB_PASSWORD: ${POSTGRES_TN_DBPASSWORD}
+    networks:
+      - ibm_demos_b2b_net
+    depends_on: 
+      - postgres
+  
+  mws:
+    image: ${REG_MWS}${REPO_MWS}:${TAG_MWS}
+    restart: ${RESTART_POLICY_RUNTIMES}
+    environment: 
+      SCRIPTS_LOGGER_LEVEL: "1"
+      JAVA_MIN_MEM: 1g
+      JAVA_MAX_MEM: 1g
+      JAVA_OPTS: "-server -Dtest=1 -Dtes2=2 -Dtest3=3"
+      DB_TYPE: postgresql
+      DB_URL: jdbc:wm:postgresql://postgres:5432;DatabaseName=${POSTGRES_TN_DB}
+      DB_USERNAME: ${POSTGRES_TN_DBUSER}
+      DB_PASSWORD: ${POSTGRES_TN_DBPASSWORD}
+      SYSADMIN_PASSWORD: ${MWS_ADMIN_PASSWORD}
+      POST_STARTUP_COMMANDS: ls -al; echo \"testing!\"
+    volumes:
+      - mws_data:/opt/softwareag/MWS/volumes/data
+      - mws_logs:/opt/softwareag/MWS/volumes/logs
+    ports:
+      - 8585:8585
+    hostname: mws
+    networks:
+      - ibm_demos_b2b_net
+    depends_on: 
+      - postgres
+
+  dbconfig:
+    image: ${REG_DBCONFIG}${REPO_DBCONFIG}:${TAG_DBCONFIG}
+    restart: ${RESTART_POLICY_JOBS}
+    environment: 
+      SCRIPTS_LOGGER_LEVEL: 1
+      DB_ACTION: create
+      DB_TYPE: POSTGRESQL
+      DB_NAME: ${POSTGRES_TN_DB}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_TN_DBUSER}
+      DB_PASSWORD: ${POSTGRES_TN_DBPASSWORD}
+      DB_JDBC_URL: ""
+      DB_JDBC_ARGS: ""
+      PRODUCT_VERSION: "11.1"
+      PRODUCT_NAMES: IS,PRE,TN,MWS,Monitor
+      COMPONENT_NAMES: 
+      RUN_FINAL_INVENTORY: "true"
+      WAITFOR_DB_HOST: "true"
+      WAITFOR_DB_TIMEOUT_SEC: "30"
+    networks:
+      - ibm_demos_b2b_net
+    depends_on: 
+      - postgres
+
+  postgres:
+    image: ${REPO_POSTGRES}
+    restart: ${RESTART_POLICY_RUNTIMES}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data:rw
+    environment:
+      POSTGRES_DB: ${POSTGRES_TN_DB}
+      POSTGRES_USER: ${POSTGRES_TN_DBUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_TN_DBPASSWORD}
+    networks:
+      - ibm_demos_b2b_net
