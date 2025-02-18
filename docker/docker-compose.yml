@@ -96,5 +96,7 @@ services:
       POSTGRES_DB: ${POSTGRES_TN_DB}
       POSTGRES_USER: ${POSTGRES_TN_DBUSER}
       POSTGRES_PASSWORD: ${POSTGRES_TN_DBPASSWORD}
+    ports:
+      - 5432:5432
     networks:
       - ibm_demos_b2b_net
