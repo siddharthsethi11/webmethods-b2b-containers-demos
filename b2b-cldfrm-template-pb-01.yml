@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  This template creates a security group and an EC2 instance that installs Docker,
+  Docker Compose, and deploys a shell script to run your containers.
+
+Parameters:
+  KeyName:
+    Description: "Name of an existing EC2 KeyPair for SSH access."
+    Type: AWS::EC2::KeyPair::KeyName
+
+  VpcId:
+    Description: "VPC ID to deploy the security group and instance (for example, your default VPC)."
+    Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Description: "Subnet ID for launching the instance. Ensure it is public (or auto-assigns public IP addresses)."
+    Type: AWS::EC2::Subnet::Id
+
+  InstanceType:
+    Description: "EC2 instance type to launch (e.g. m5.large)."
+    Type: String
+    Default: "m5.large"
+
+  AmiId:
+    Description: "AMI ID to use for the instance. (Latest Amazon Linux 2 AMI)"
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs"
+
+Resources:
+  InstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH, MSR, MWS, and PostgreSQL access."
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5555
+          ToPort: 5555
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8585
+          ToPort: 8585
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: "Webmethods-SG"
+
+  DockerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref AmiId
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref InstanceSG
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          # Update system and install Docker & Docker Compose
+          yum update -y
+          amazon-linux-extras install docker -y
+          systemctl start docker
+          systemctl enable docker
+          usermod -aG docker ec2-user
+
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # Docker login command: replace with your actual Docker registry credentials
+          docker login --username amajusag --password xxxxxxxxxxxx
+
+          # Create application directory
+          mkdir -p /home/ec2-user/docker-app
+          cd /home/ec2-user/docker-app
+
+          # Write the shell script to a file (b2b-simplified-01.sh)
+          cat > b2b-simplified-01.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+          set -e
+
+          # Define environment variables
+          export POSTGRES_TN_DB=webmisdb
+          export POSTGRES_TN_DBUSER=webmisdbuser
+          export POSTGRES_TN_DBPASSWORD=myStrongPassword123!
+          export MWS_ADMIN_PASSWORD=SomeNewStrongPassword123!
+
+          # Cleanup function: remove existing containers, network, and prune volumes
+          cleanup() {
+              for container in mws postgres dbconfig msr; do
+                  if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+                      echo "Removing container ${container}..."
+                      docker rm -f ${container}
+                  fi
+              done
+
+              if docker network ls --format '{{.Name}}' | grep -q '^ibm_demos_b2b_net$'; then
+                  echo "Removing network ibm_demos_b2b_net..."
+                  docker network rm ibm_demos_b2b_net
+              fi
+
+              echo "Pruning unused volumes..."
+              docker volume prune -f
+          }
+
+          # Create Docker network if it doesn't exist
+          create_network() {
+              if ! docker network inspect ibm_demos_b2b_net >/dev/null 2>&1; then
+                  echo "Creating network ibm_demos_b2b_net..."
+                  docker network create ibm_demos_b2b_net
+              fi
+          }
+
+          # Execute cleanup and create network
+          cleanup
+          create_network
+
+          # Start PostgreSQL container using postgres:14
+          echo "Starting PostgreSQL..."
+          docker run -d \
+              --name postgres \
+              --restart unless-stopped \
+              -p 5432:5432 \
+              -v postgres_data:/var/lib/postgresql/data:rw \
+              -e POSTGRES_DB=$POSTGRES_TN_DB \
+              -e POSTGRES_USER=$POSTGRES_TN_DBUSER \
+              -e POSTGRES_PASSWORD=$POSTGRES_TN_DBPASSWORD \
+              --network ibm_demos_b2b_net \
+              postgres:14
+
+          # Wait for PostgreSQL to be ready
+          echo "Waiting for PostgreSQL to be ready..."
+          docker exec -i postgres bash -c 'while ! pg_isready -U $POSTGRES_USER -d $POSTGRES_TN_DB; do sleep 2; done'
+
+          # Run DB configuration container
+          echo "Running DB configuration..."
+          docker run -d \
+              --name dbconfig \
+              --restart unless-stopped \
+              -e DB_ACTION=create \
+              -e DB_TYPE=POSTGRESQL \
+              -e DB_NAME=$POSTGRES_TN_DB \
+              -e DB_HOST=postgres \
+              -e DB_PORT=5432 \
+              -e DB_USER=$POSTGRES_TN_DBUSER \
+              -e DB_PASSWORD=$POSTGRES_TN_DBPASSWORD \
+              -e PRODUCT_VERSION="11.1" \
+              -e PRODUCT_NAMES="IS,PRE,TN,MWS,Monitor" \
+              -e RUN_FINAL_INVENTORY="true" \
+              -e WAITFOR_DB_HOST="true" \
+              -e WAITFOR_DB_TIMEOUT_SEC="30" \
+              --network ibm_demos_b2b_net \
+              amajusag/webmethods-dbconfig:11.1
+
+          # Start MWS container
+          echo "Starting MWS..."
+          docker run -d \
+              --name mws \
+              -p 8585:8585 \
+              -e SCRIPTS_LOGGER_LEVEL="1" \
+              -e JAVA_MIN_MEM="1g" \
+              -e JAVA_MAX_MEM="1g" \
+              -e JAVA_OPTS="-server -Dtest=1 -Dtes2=2 -Dtest3=3" \
+              -e DB_TYPE="postgresql" \
+              -e DB_URL="jdbc:wm:postgresql://postgres:5432;DatabaseName=$POSTGRES_TN_DB" \
+              -e DB_USERNAME="$POSTGRES_TN_DBUSER" \
+              -e DB_PASSWORD="$POSTGRES_TN_DBPASSWORD" \
+              -e SYSADMIN_PASSWORD="$MWS_ADMIN_PASSWORD" \
+              -e POST_STARTUP_COMMANDS="ls -al; echo \"testing!\"" \
+              -v mws_data:/opt/softwareag/MWS/volumes/data \
+              -v mws_logs:/opt/softwareag/MWS/volumes/logs \
+              --network ibm_demos_b2b_net \
+              amajusag/webmethods-mws:11.1
+
+          # Start MSR container
+          echo "Starting MSR..."
+          docker run -d \
+              --name msr \
+              --network ibm_demos_b2b_net \
+              -p 5555:5555 \
+              -v /home/ec2-user/application.properties:/opt/softwareag/IntegrationServer/application.properties:ro \
+              -e ADMIN_PASSWORD="$MWS_ADMIN_PASSWORD" \
+              -e JAVA_CUSTOM_OPTS="-server -Dtest=1 -Dtes2=2 -Dtest3=3" \
+              -e JAVA_MIN_MEM=1g \
+              -e JAVA_MAX_MEM=1g \
+              -e TN_DB_URL="jdbc:wm:postgresql://postgres:5432;DatabaseName=$POSTGRES_TN_DB" \
+              -e TN_DB_USER="$POSTGRES_TN_DBUSER" \
+              -e TN_DB_PASSWORD="$POSTGRES_TN_DBPASSWORD" \
+              amajusag/webmethods-msr-b2b:11.1.1
+
+          echo "All services started successfully!"
+          SCRIPT_EOF
+
+          # Add execute permission to the shell script so that it can be run manually
+          chmod +x /home/ec2-user/docker-app/b2b-simplified-01.sh
+
+          echo "Shell script deployed at /home/ec2-user/docker-app/b2b-simplified-01.sh."
+          echo "You can execute it at will."
+      Tags:
+        - Key: Name
+          Value: "Webmethods-Docker-Host"
+
+Outputs:
+  InstancePublicIP:
+    Description: "Public IP address of the launched EC2 instance"
+    Value: !GetAtt DockerInstance.PublicIp
+  InstanceId:
+    Description: "EC2 Instance ID"
+    Value: !Ref DockerInstance
